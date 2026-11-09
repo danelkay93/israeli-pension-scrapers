@@ -1,6 +1,4 @@
-// Public types the library exposes. Mirrors the shape of israeli-bank-scrapers
-// where it overlaps, so a consumer that already speaks that vocabulary can
-// drop a pension fund in alongside a bank with no extra mapping.
+// Public types. Consumers must inspect identity, date and completeness metadata.
 
 /** Catalog entry shown in an "add a pension connection" picker. */
 export interface PensionCompanyInfo {
@@ -24,13 +22,16 @@ export interface PensionCompanyInfo {
 
 /** A single product (pension, gemel, study fund) the member holds. */
 export interface PensionAccount {
-  /** Stable per-product reference the provider gives — used as the dedup key
-   *  on rescrape. Falls back to the product name when no id is on offer. */
+  /** Provider-qualified product ID. Never a label or an amount. */
   accountNumber: string;
   /** Human-readable product name as the portal shows it. */
   label?: string;
-  /** Current accumulated balance, in `currency`. */
+  /** Current accumulated balance, only available with a verified provider date. */
   balance?: number;
+  /** Amount observed in the response; not a verified current balance. */
+  observedBalance?: number;
+  balanceAsOf: string | null;
+  observedAt: string;
   /** ISO-4217 code — `ILS` in practice for every Israeli provider. */
   currency: string;
   /**
@@ -45,6 +46,14 @@ export interface PensionAccount {
 export interface PensionScrapeOutcome {
   success: boolean;
   accounts: PensionAccount[];
+  complete: boolean;
+  identityVerified: boolean;
+  warnings: string[];
+  /** Observations without a usable unique product mapping. Never aggregate or deduplicate by label/amount. */
+  unresolvedProducts?: { label: string; observedBalance: number; balanceAsOf: null; observedAt: string;
+    currency: string; reason: 'PRODUCT_ID_UNAVAILABLE' | 'AMBIGUOUS_DUPLICATE_PRODUCT'; providerProductId?: string }[];
+  /** Fixed code: CONFIG, CONNECTION_BUSY, LOGIN_FAILED, OTP_REJECTED, OTP_UNCONFIRMED,
+   * INTERACTIVE_TIMEOUT, NEEDS_MAPPING, NEEDS_CONSENT or SCRAPE_FAILED. */
   errorType?: string;
   errorMessage?: string;
 }
@@ -53,9 +62,8 @@ export interface PensionScrapeOutcome {
 export type OtpCallback = () => Promise<string>;
 
 /**
- * Pluggable session storage. The default implementation in `./session.ts`
- * writes JSON files to the OS-appropriate data dir, but a consumer can
- * supply their own (encrypted vault, database row, in-memory map, …).
+ * Pluggable session storage. Each scrape defaults to fresh memory-only state.
+ * A consumer can explicitly supply a vault, shared memory or file store.
  *
  * `cookies` is a Puppeteer cookie list — the same shape `page.cookies()`
  * returns. The library treats them as opaque on save/load.
@@ -65,6 +73,7 @@ export interface SessionStore {
   load(connectionId: string): Promise<unknown[] | null>;
   /** Persists the current browser cookies under the connection id. */
   save(connectionId: string, cookies: unknown[]): Promise<void>;
+  clear(connectionId: string): Promise<void>;
 }
 
 /** Arguments for {@link scrapePension}. */
@@ -77,16 +86,19 @@ export interface ScrapePensionArgs {
   onProgress?: (message: string) => void;
   /** Called when the OTP code is needed — your UI prompts the user. */
   onOtpNeeded?: OtpCallback;
-  /** Optional connection id used as the session-store key (e.g. `migdal-1`). */
+  /** Full connection identity; required when credentials.id is absent. Do not reuse for another member. */
   connectionId?: string;
-  /** Optional session store; defaults to the JSON-file store. */
+  /** Explicit session store; defaults to fresh memory-only state per scrape. */
   session?: SessionStore;
-  /** Where to write a failure screenshot, if a sync fails. */
+  /** Deprecated: raw screenshots/HTML/JSON are no longer captured or written. */
   screenshotPath?: string;
+  /** Explicit opt-in root for persistent browser profiles. Omit for ephemeral profiles,
+   * including with a vault SessionStore. Profiles contain unencrypted session state;
+   * use an owner-only directory/Windows ACL. Keyed by the full connection identity. */
+  profileBaseDir?: string;
   /**
    * Defaults to `true`. Set `false` to launch a visible browser even for the
-   * headless-friendly funds — useful when a provider's WAF rejects you and
-   * you want to watch the page.
+   * headless-friendly funds to inspect normal sign-in. Stop on an access refusal.
    */
   headless?: boolean;
 }

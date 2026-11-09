@@ -1,103 +1,100 @@
-// Default file-based session store. Cookies are written to a JSON file under
-// the OS-appropriate per-user data directory:
-//
-//   macOS    ~/Library/Application Support/israeli-pension-scrapers/
-//   Windows  %APPDATA%\israeli-pension-scrapers\
-//   Linux    $XDG_DATA_HOME/israeli-pension-scrapers/
-//            (falls back to ~/.local/share/israeli-pension-scrapers/)
-//
-// A consumer that wants encryption, an existing vault, or any other backing
-// store can implement the SessionStore interface themselves and pass it to
-// `scrapePension`.
-
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, rmSync, chmodSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionStore } from './types.js';
 
-// Sessions older than this are dropped unused — replaying long-dead cookies
-// just wastes a navigation, and the cap bounds how long a leaked bundle is
-// useful.
-const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+interface SessionBundle { savedAt: number; cookies: unknown[]; }
 
-interface SessionBundle {
-  savedAt: number;
-  cookies: unknown[];
-}
-
-/**
- * Picks the OS-conventional per-user data directory for `appName`. Used to
- * keep the default session store self-locating — consumers can override it
- * with `createFileSessionStore({ baseDir })` if they have a preferred path.
- */
 export function defaultDataDir(appName = 'israeli-pension-scrapers'): string {
   const home = homedir();
-  if (process.platform === 'darwin') {
-    return join(home, 'Library', 'Application Support', appName);
-  }
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming');
-    return join(appData, appName);
-  }
-  const xdg = process.env.XDG_DATA_HOME ?? join(home, '.local', 'share');
-  return join(xdg, appName);
+  if (process.platform === 'darwin') return join(home, 'Library', 'Application Support', appName);
+  if (process.platform === 'win32') return join(process.env.APPDATA ?? join(home, 'AppData', 'Roaming'), appName);
+  return join(process.env.XDG_DATA_HOME ?? join(home, '.local', 'share'), appName);
+}
+
+/** Hash the entire provider-qualified identity, without sanitizing or truncating. */
+export function connectionKey(fundId: string, connectionId?: string, memberId?: string): string {
+  if (!connectionId?.trim() && !memberId?.trim()) throw new Error('CONNECTION_ID_REQUIRED');
+  return createHash('sha256').update(JSON.stringify([fundId, connectionId ?? null, memberId?.trim() ?? null])).digest('hex');
+}
+
+function fileKey(key: string): string {
+  return createHash('sha256').update(key).digest('hex');
 }
 
 export interface FileSessionStoreOptions {
-  /** Override the on-disk root. Defaults to the OS per-user data dir. */
   baseDir?: string;
-  /** Override the default app/folder name under the data dir. */
   appName?: string;
-  /** TTL in ms; bundles older than this are ignored on `load`. */
+  /** Invalid, future-dated and expired bundles are deleted on load. */
   maxAgeMs?: number;
 }
 
-/**
- * Creates a {@link SessionStore} that writes one JSON file per connection
- * under the OS data directory. Safe to share between processes.
- */
-export function createFileSessionStore(opts: FileSessionStoreOptions = {}): SessionStore {
-  const dir = opts.baseDir ?? defaultDataDir(opts.appName ?? 'israeli-pension-scrapers');
-  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
-
-  // Cookies are scoped per connection: a single provider key would prevent
-  // a consumer running two member portals under one process (e.g. their own
-  // pension plus a partner's), and the file name is the only namespace.
-  const pathFor = (connectionId: string): string =>
-    join(dir, `session-${sanitise(connectionId)}.json`);
-
+/** Explicitly share this store to reuse cookies in memory across scrapes.
+ * The scrape default creates a fresh instance each time and persists nothing. */
+export function createMemorySessionStore(): SessionStore {
+  const cookiesByKey = new Map<string, unknown[]>();
   return {
-    async load(connectionId) {
-      try {
-        const file = pathFor(connectionId);
-        if (!existsSync(file)) return null;
-        const bundle = JSON.parse(readFileSync(file, 'utf8')) as SessionBundle;
-        if (
-          !Array.isArray(bundle.cookies) ||
-          bundle.cookies.length === 0 ||
-          Date.now() - bundle.savedAt > maxAgeMs
-        ) {
-          return null;
-        }
-        return bundle.cookies;
-      } catch {
-        return null;
-      }
-    },
-    async save(connectionId, cookies) {
-      try {
-        if (!cookies || cookies.length === 0) return;
-        mkdirSync(dir, { recursive: true });
-        const bundle: SessionBundle = { savedAt: Date.now(), cookies };
-        writeFileSync(pathFor(connectionId), JSON.stringify(bundle), 'utf8');
-      } catch {
-        /* best effort — a failed save just means the next sync signs in fresh */
-      }
-    },
+    async load(key) { return cookiesByKey.get(key) ?? null; },
+    async save(key, cookies) { cookiesByKey.set(key, cookies); },
+    async clear(key) { cookiesByKey.delete(key); },
   };
 }
 
-/** Strips path separators and other risky characters from a connection id. */
-function sanitise(id: string): string {
-  return id.replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'default';
+/** Plaintext storage. POSIX modes do not provide Windows ACL protection. */
+export function createFileSessionStore(opts: FileSessionStoreOptions = {}): SessionStore {
+  const dir = opts.baseDir ?? defaultDataDir(opts.appName);
+  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) throw new Error('INVALID_SESSION_TTL');
+  const pathFor = (key: string): string => join(dir, 'session-' + fileKey(key) + '.json');
+  const clear = async (key: string): Promise<void> => {
+    try { unlinkSync(pathFor(key)); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  };
+  return {
+    async load(key) {
+      try {
+        const bundle = JSON.parse(readFileSync(pathFor(key), 'utf8')) as SessionBundle;
+        const age = Date.now() - bundle.savedAt;
+        if (!Number.isFinite(bundle.savedAt) || age < 0 || age > maxAgeMs
+          || !Array.isArray(bundle.cookies) || !bundle.cookies.length) {
+          await clear(key);
+          return null;
+        }
+        return bundle.cookies;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') await clear(key);
+        return null;
+      }
+    },
+    async save(key, cookies) {
+      if (!cookies.length) return clear(key);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (process.platform !== 'win32') chmodSync(dir, 0o700);
+      const destination = pathFor(key);
+      const temporary = destination + '.' + randomBytes(16).toString('hex') + '.tmp';
+      try {
+        writeFileSync(temporary, JSON.stringify({ savedAt: Date.now(), cookies }), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        renameSync(temporary, destination);
+      } finally {
+        try { unlinkSync(temporary); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+    },
+    clear,
+  };
+}
+
+/** Clear local cookies and the matching optional profile. Close active scrapes first.
+ * This cannot revoke tokens at the provider; use its sign-out/revoke controls too. */
+export async function clearPensionSession(args: {
+  fundId: string; connectionId?: string; memberId?: string;
+  session?: SessionStore; profileBaseDir?: string;
+}): Promise<void> {
+  const key = connectionKey(args.fundId, args.connectionId, args.memberId);
+  await args.session?.clear(key);
+  if (args.profileBaseDir) rmSync(join(args.profileBaseDir, key), { recursive: true, force: true });
 }

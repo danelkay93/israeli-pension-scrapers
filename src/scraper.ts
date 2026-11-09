@@ -1,40 +1,20 @@
-// Pension / קרן השתלמות / קופות גמל connector.
-//
-// Israeli pension, gemel and study-fund providers each run their own member
-// portal — there is no shared scraping library for them the way
-// israeli-bank-scrapers covers the banks. This module drives a provider's
-// portal in a Puppeteer browser and reads the accumulated balance of every
-// product the member holds.
-//
-// Migdal, Harel and Clal use **passwordless OTP login** — the library fills
-// the form, relays the SMS code via your `onOtpNeeded` callback, and reads
-// the balances headless.
-//
-// Meitav and Menora sit behind CAPTCHA bot-walls (reCAPTCHA Enterprise /
-// Radware + hCaptcha) that resist automation, so they run in a **visible
-// Chromium window**: the library pre-fills the ID/phone, the user clears
-// the security check and enters the SMS code themselves, then the library
-// reads the balances. The session cookies are saved (via the SessionStore
-// you supply, or the default file-based one) so the next sync resumes
-// already logged in — no sign-in at all — until they expire.
+// Pension connector. Only evidenced source observations are returned; identity,
+// as-of dates and completeness must be checked by consumers. Session state is
+// ephemeral unless the caller explicitly supplies a store or profile directory.
 
-import { writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import puppeteerVanilla, { type Browser, type Frame, type Page } from 'puppeteer';
-import { addExtra } from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { mkdirSync, rmSync, chmodSync } from 'node:fs';
+import { join } from 'node:path';
+import puppeteerVanilla, { type Browser, type Page } from 'puppeteer';
 import type {
-  OtpCallback,
   PensionAccount,
   PensionCompanyInfo,
   PensionScrapeOutcome,
   ScrapePensionArgs,
   SessionStore,
 } from './types.js';
-import { createFileSessionStore, defaultDataDir } from './session.js';
+import { createMemorySessionStore, connectionKey } from './session.js';
 
-// Internal aliases — the rest of the file was written against these names
-// and is left untouched so it reads identically to the Hon source.
+// Internal aliases for the public result types.
 type NormalizedAccount = PensionAccount;
 type ScrapeOutcome = PensionScrapeOutcome;
 type CompanyInfo = PensionCompanyInfo;
@@ -69,13 +49,6 @@ async function persistSession(browser: Browser, session?: SessionHandle): Promis
   }
 }
 
-// Wrap the project's puppeteer with the stealth plugin — it masks the most
-// obvious automation tells, which helps every portal load normally.
-// puppeteer-extra's bundled types lag the installed puppeteer; the cast keeps
-// the call site clean — the runtimes are compatible.
-const puppeteer = addExtra(puppeteerVanilla as unknown as Parameters<typeof addExtra>[0]);
-puppeteer.use(StealthPlugin());
-
 // page.evaluate runs its callback in the browser, where these globals exist.
 declare const document: any;
 declare const location: any;
@@ -99,7 +72,7 @@ interface PensionFund {
   phonePrefixSelector?: string;
   /** CSS selector for the "send the code by SMS" radio, clicked to be sure. */
   smsRadioSelector?: string;
-  /** CSS selector for a "I agree to the terms" checkbox that gates submit. */
+  /** Terms checkbox that gates submit. Never ticked: a fresh login returns NEEDS_CONSENT. */
   termsCheckboxSelector?: string;
   /** Text on the button that submits the form — omitted for interactive funds. */
   submitLabels?: string[];
@@ -134,7 +107,8 @@ const FUNDS: Record<string, PensionFund> = {
     idSelector: '[formcontrolname="tz"]',
     phoneSelector: '[formcontrolname="mobile"]',
     // The login form is Angular Material: SMS is the first delivery radio and
-    // a terms checkbox gates the "שליחה" submit button.
+    // a terms checkbox gates the "שליחה" submit button. The library never ticks
+    // it, so a fresh login returns NEEDS_CONSENT; only a saved session is read.
     smsRadioSelector: '#mat-radio-2-input',
     termsCheckboxSelector: '#mat-checkbox-1-input',
     submitLabels: ['שליחה', 'שלח', 'המשך', 'כניסה'],
@@ -217,6 +191,11 @@ const DEFAULT_HEADLESS = process.env.PENSION_SCRAPERS_HEADFUL !== '1';
 // How long an interactive fund waits for the user to finish signing in (and
 // pass the CAPTCHA + OTP) in the visible browser window before giving up.
 const INTERACTIVE_LOGIN_TIMEOUT_MS = 5 * 60_000;
+const activeConnections = new Set<string>();
+
+// Funds with no reviewed product/balance reader (see readBalances). A login
+// could only end in NEEDS_MAPPING, so no credential or OTP request is made.
+const UNMAPPED_FUNDS = new Set(['harel']);
 
 // In a container Chromium runs as root with no user namespace, so its
 // sandbox cannot start — set PENSION_SCRAPERS_NO_SANDBOX=1 to drop it. On a
@@ -225,10 +204,6 @@ const SANDBOX_ARGS: string[] =
   process.env.PENSION_SCRAPERS_NO_SANDBOX === '1'
     ? ['--no-sandbox', '--disable-setuid-sandbox']
     : [];
-
-const USER_AGENT =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 // The OTP code-entry step exposes dedicated inputs. Migdal renders six boxes
 // all named otp, otp2…otp6; a waitForSelector on this catches that step
@@ -249,7 +224,7 @@ function delay(ms: number): Promise<void> {
 }
 
 function fail(errorType: string, errorMessage: string): ScrapeOutcome {
-  return { success: false, accounts: [], errorType, errorMessage };
+  return { success: false, accounts: [], complete: false, identityVerified: false, warnings: [], errorType, errorMessage };
 }
 
 /** Logs a pension-connector diagnostic line to the sidecar console (stderr). */
@@ -257,324 +232,132 @@ function plog(...parts: unknown[]): void {
   console.error('[pension]', ...parts);
 }
 
-/** Derives a debug-file path next to the run's failure screenshot. */
-function debugSibling(screenshotPath: string | undefined, suffix: string): string | undefined {
-  return screenshotPath ? screenshotPath.replace(/\.png$/i, suffix) : undefined;
-}
-
-/**
- * Launches a Chromium for a pension scrape and prepares a page: user agent,
- * Hebrew Accept-Language, the tsx `__name` shim, and a JSON-response collector
- * feeding `jsonResponses` (the dashboard's real balance data, kept for debug).
- * A headless launch sizes the viewport; a visible one lets the OS size the
- * window. CAPTCHA-walled funds launch visible so the user can sign in.
- *
- * `profileDir` opts into a persistent Chrome profile: the real installed
- * Google Chrome (less bot-detectable than the bundled Chromium) reusing a
- * dedicated on-disk profile, so cookies and reCAPTCHA reputation carry across
- * runs — the next sync resumes already signed in. Falls back to the bundled
- * Chromium when Chrome is not installed.
- */
-async function launchPensionBrowser(
-  headless: boolean,
-  jsonResponses: { url: string; body: string }[],
-  profileDir?: string,
-): Promise<{ browser: Browser; page: Page }> {
-  const launchOptions = {
-    headless,
-    defaultViewport: headless ? undefined : null,
-    userDataDir: profileDir,
-    args: [
-      ...SANDBOX_ARGS,
-      '--disable-blink-features=AutomationControlled',
-      '--lang=he-IL',
-      ...(headless ? [] : ['--window-size=1280,960']),
-    ],
-  };
-  let browser: Browser;
-  try {
-    // Prefer the real installed Chrome for a persistent profile.
-    browser = await puppeteer.launch(
-      profileDir ? { ...launchOptions, channel: 'chrome' } : launchOptions,
-    );
-  } catch (err) {
-    if (!profileDir) throw err;
-    // Chrome is not installed — fall back to the bundled Chromium, still with
-    // the persistent profile so cookies survive between runs.
-    plog('launchPensionBrowser: real Chrome unavailable, using bundled Chromium');
-    browser = await puppeteer.launch(launchOptions);
-  }
-  const page = await browser.newPage();
-  await page.setUserAgent(USER_AGENT);
-  if (headless) await page.setViewport({ width: 1280, height: 900 });
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'he-IL,he;q=0.9,en;q=0.8' });
-  // tsx/esbuild rewrites this file's functions with a `__name` helper. When a
-  // function is handed to page.evaluate it runs in the browser, where that
-  // helper is undefined — so define it as a no-op in every document.
-  await page.evaluateOnNewDocument(
-    'window.__name = window.__name || function (f) { return f; };',
-  );
-  // Collect JSON API responses — the dashboard's real balance data, and the
-  // best material for tightening the balance reader after a real run.
-  page.on('response', (res) => {
-    const contentType = res.headers()['content-type'] ?? '';
-    if (!contentType.includes('json') || jsonResponses.length >= 60) return;
-    res
-      .text()
-      .then((body) => {
-        if (body && body.length < 200_000) {
-          jsonResponses.push({ url: res.url(), body });
-        }
-      })
-      .catch(() => {});
+/** Launch with ordinary browser settings; no stealth or bot-wall bypass. */
+async function launchPensionBrowser(headless: boolean, profileDir?: string): Promise<{ browser: Browser; page: Page }> {
+  const browser = await puppeteerVanilla.launch({
+    headless, defaultViewport: headless ? undefined : null, userDataDir: profileDir,
+    args: [...SANDBOX_ARGS, '--lang=he-IL', ...(headless ? [] : ['--window-size=1280,960'])],
   });
-  return { browser, page };
+  try {
+    const page = await browser.newPage();
+    if (headless) await page.setViewport({ width: 1280, height: 900 });
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'he-IL,he;q=0.9,en;q=0.8' });
+    await page.evaluateOnNewDocument('window.__name = window.__name || function (f) { return f; };');
+    return { browser, page };
+  } catch (error) {
+    await browser.close().catch(() => {});
+    throw error;
+  }
 }
 
-/**
- * Logs into a pension provider's member portal and reads each product's
- * balance. The public entry point — drives the whole login itself, because
- * pension funds have no shared scraping library the way the banks do.
- */
+/** Reads source observations; success does not assert completeness or member identity. */
 export async function scrapePension(args: ScrapePensionArgs): Promise<ScrapeOutcome> {
-  const {
-    fundId,
-    credentials,
-    onProgress,
-    onOtpNeeded,
-    connectionId,
-    session: userStore,
-    screenshotPath,
-    headless,
-  } = args;
-
-  const fund = FUNDS[fundId];
-  if (!fund) return fail('CONFIG', `Unknown pension fund: ${fundId}`);
-  // CAPTCHA-walled funds (Meitav/Menora) run in a visible window the user
-  // signs in to; the rest are driven headless by the library.
-  const captchaWalled = Boolean(fund.interactive);
-  plog(`start ${fundId}: captchaWalled=${captchaWalled}`);
-
-  // A non-CAPTCHA fund is driven entirely by the library, so its credentials
-  // are required up front. A CAPTCHA-walled fund can always fall back to a
-  // hand sign-in, so missing credentials there are not fatal.
-  if (!captchaWalled) {
-    if (!(credentials.id ?? '').trim()) {
-      return fail('CONFIG', 'This pension connection needs an ID number.');
-    }
-    if (fund.phoneSelector && !(credentials.phone ?? '').trim()) {
-      return fail('CONFIG', 'This pension connection needs a phone number.');
-    }
+  const { fundId, credentials, onProgress, onOtpNeeded, connectionId,
+    session: userStore, profileBaseDir, headless } = args;
+  if (!isPensionCompany(fundId)) return fail('CONFIG', 'Unknown pension fund.');
+  const fund = FUNDS[fundId]!;
+  if (UNMAPPED_FUNDS.has(fundId)) {
+    return { ...fail('NEEDS_MAPPING', 'No reviewed product/balance mapping exists for this fund; no login was attempted.'),
+      warnings: ['PRODUCT_AND_BALANCE_MAPPING_REQUIRED'] };
   }
-
-  if (!onOtpNeeded && !captchaWalled) {
-    return fail('CONFIG',
-      'This fund needs an onOtpNeeded callback to relay the SMS code.');
+  const interactive = Boolean(fund.interactive);
+  if (!interactive && (!credentials.id?.trim() || (fund.phoneSelector && !credentials.phone?.trim()))) {
+    return fail('CONFIG', 'This connection needs its required identity and phone fields.');
   }
+  if (!interactive && !onOtpNeeded) return fail('CONFIG', 'An OTP callback is required.');
+  let sessionKey: string;
+  try { sessionKey = connectionKey(fundId, connectionId, credentials.id); }
+  catch { return fail('CONFIG', 'Provide a connectionId or member ID; never share it between members.'); }
 
-  // Build a SessionHandle from the user-supplied store (or the default
-  // file-based one). connectionId scopes saved cookies so two members of
-  // the same fund can share a process without overwriting each other.
-  const store: SessionStore = userStore ?? createFileSessionStore();
-  const sessionKey = connectionId ?? `${fundId}-default`;
-  const restoredCookies = await store.load(sessionKey).catch(() => null);
-  const session: SessionHandle = {
-    cookies: restoredCookies ?? undefined,
-    save: (cookies) => store.save(sessionKey, cookies),
-  };
-
-  const htmlPath = debugSibling(screenshotPath, '-pension.html');
-  const dataPath = debugSibling(screenshotPath, '-pension.json');
-  const jsonResponses: { url: string; body: string }[] = [];
-
+  if (activeConnections.has(sessionKey)) return fail('CONNECTION_BUSY', 'This connection already has an active scrape in this process.');
+  activeConnections.add(sessionKey);
+  const store: SessionStore = userStore ?? createMemorySessionStore();
   let browser: Browser | undefined;
-  let page!: Page;
   try {
-    onProgress?.('Starting the browser…');
-    // CAPTCHA-walled funds open a *visible* window the user signs in to,
-    // using a persistent real-Chrome profile so the sign-in (and its
-    // reCAPTCHA reputation) sticks across runs. The rest run headless.
-    // The profile lives in the OS data dir so it survives process restarts.
-    const profileDir =
-      captchaWalled ? join(defaultDataDir(), 'browser-profiles', fundId) : undefined;
-    const wantHeadless = headless ?? DEFAULT_HEADLESS;
-    ({ browser, page } = await launchPensionBrowser(
-      !captchaWalled && wantHeadless,
-      jsonResponses,
-      profileDir,
-    ));
-
-    // Replay a saved session's cookies before any navigation, so the portal
-    // can recognise the session and skip the sign-in.
+    const restoredCookies = await store.load(sessionKey);
+    const session: SessionHandle = {
+      cookies: restoredCookies ?? undefined,
+      save: (cookies) => store.save(sessionKey, cookies),
+    };
+    const profileDir = profileBaseDir ? join(profileBaseDir, sessionKey) : undefined;
+    if (profileDir) {
+      // A profile must not silently resurrect an expired/cleared cookie session.
+      if (!restoredCookies?.length) rmSync(profileDir, { recursive: true, force: true });
+      mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+      if (process.platform !== 'win32') chmodSync(profileDir, 0o700);
+    }
+    onProgress?.('Starting the browser.');
+    const launched = await launchPensionBrowser(!interactive && (headless ?? DEFAULT_HEADLESS), profileDir);
+    browser = launched.browser;
+    const page = launched.page;
     await restoreSession(browser, session);
 
-    // Fast path: with a saved session, open the products page directly. If the
-    // portal still trusts the session it renders balances with no login and no
-    // SMS code; otherwise it bounces to a login URL and the normal sign-in
-    // runs. CAPTCHA-walled funds handle their own resume below. Any failure
-    // here is non-fatal — the run just falls through to a full sign-in.
-    if (!captchaWalled && fund.productsUrl && session?.cookies?.length) {
-      onProgress?.('Resuming your saved session…');
-      try {
-        await page.goto(fund.productsUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60_000,
-        });
-        if (!/login/i.test(page.url())) {
-          const resumed = await readBalances(fundId, page, screenshotPath).catch(
-            () => [] as NormalizedAccount[],
-          );
-          if (resumed.length > 0) {
-            await persistSession(browser, session);
-            await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses).catch(
-              () => {},
-            );
-            return { success: true, accounts: resumed };
-          }
-        }
-      } catch {
-        /* fall through to a normal sign-in */
-      }
-      onProgress?.('Saved session has expired — signing in again…');
-    }
-
-    onProgress?.('Opening the pension portal…');
-    try {
-      await page.goto(fund.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    } catch (err) {
-      // A CAPTCHA-walled fund's bot-wall may re-navigate the page during goto;
-      // that race is harmless. For an automated fund a goto failure is real.
-      if (!captchaWalled) throw err;
-    }
-
-    // CAPTCHA-walled funds (Meitav/Menora). A visible Chromium window is open:
-    // a restored session may already be signed in; otherwise the user signs in
-    // by hand. Hon pre-fills the ID/phone, polls the balance API, and on
-    // success saves the session so the next sync resumes already logged in.
-    if (captchaWalled) {
-      // A restored session may still authenticate the balance API — try a
-      // read before asking the user to sign in at all.
-      if (session?.cookies?.length) {
-        onProgress?.('Resuming your saved session…');
-        const resumed = await readBalances(fundId, page, screenshotPath).catch(
-          () => [] as NormalizedAccount[],
-        );
-        if (resumed.length > 0) {
+    if (!interactive && fund.productsUrl && restoredCookies?.length) {
+      onProgress?.('Resuming the isolated saved session; member identity is not verified by this mapping.');
+      await page.goto(fund.productsUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      if (!/login/i.test(page.url())) {
+        const read = await readBalances(fundId, page);
+        if (hasObservations(read)) {
           await persistSession(browser, session);
-          await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses).catch(
-            () => {},
-          );
-          return { success: true, accounts: resumed };
+          return outcome(read);
         }
       }
-      // Not signed in — the user does it themselves in the visible window.
-      // Hon pre-fills the ID and phone (fire-and-forget, so the balance poll
-      // runs alongside) and waits for the sign-in to complete.
-      onProgress?.(
-        `A Chromium window is open — sign in to ${fund.name} there. Hon fills ` +
-          'your ID and phone; you clear the security check and enter the SMS code.',
-      );
+    }
+
+    // Only the account holder can review and accept a portal's current terms, and
+    // nothing here records that, so a terms-gated fresh login stops before any form.
+    if (!interactive && fund.termsCheckboxSelector) {
+      return fail('NEEDS_CONSENT', 'A fresh login requires accepting the portal terms, which only the account holder can review and accept. No reviewed consent step exists, so nothing was filled or submitted and no consent was given.');
+    }
+
+    onProgress?.('Opening the pension portal.');
+    await page.goto(fund.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    if (interactive) {
+      onProgress?.('Sign in in the browser and check the member identity there. Stop if access is refused.');
       void prefillCredentials(page, fund, credentials).catch(() => {});
-      onProgress?.('Waiting for you to finish signing in…');
       const deadline = Date.now() + INTERACTIVE_LOGIN_TIMEOUT_MS;
-      let accounts: NormalizedAccount[] = [];
-      while (Date.now() < deadline) {
-        await delay(5000);
-        if (page.isClosed()) break;
-        try {
-          accounts = await readBalances(fundId, page, screenshotPath);
-        } catch {
-          accounts = []; // a navigation mid-read — try again next tick
+      let read = emptyRead('BALANCE_RESPONSE_UNAVAILABLE');
+      while (Date.now() < deadline && !page.isClosed()) {
+        read = await readBalances(fundId, page);
+        if (hasObservations(read)) {
+          await persistSession(browser, session);
+          return outcome(read);
         }
-        if (accounts.length > 0) break;
+        if (read.warnings.includes('AMBIGUOUS_DUPLICATE_PRODUCT')) return outcome(read);
+        await delay(5000);
       }
-      await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses).catch(
-        () => {},
-      );
-      if (accounts.length === 0) {
-        return fail(
-          'INTERACTIVE_TIMEOUT',
-          `Sign-in to ${fund.name} was not completed in the browser window. ` +
-            'Open the connection again and finish signing in.',
-        );
-      }
-      await persistSession(browser, session);
-      return { success: true, accounts };
+      return { ...fail('INTERACTIVE_TIMEOUT', 'No usable products were read. Check sign-in manually before any retry.'),
+        warnings: read.warnings };
     }
 
-    onProgress?.('Logging in…');
+    onProgress?.('Logging in.');
     if (!(await fillAndSubmitLogin(page, fund, credentials))) {
-      await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses);
-      return fail(
-        'LOGIN_FAILED',
-        'Could not find the login form on the portal. A debug page was saved.',
-      );
+      return fail('LOGIN_FAILED', 'The login form could not be completed. Check the portal before retrying.');
     }
-
-    // Both portals are passwordless: after login they send an SMS code and
-    // show a code-entry step. waitForSelector reliably catches it — it polls
-    // the live DOM for the code boxes, surviving the headless re-renders that
-    // made an evaluate-based page check unreliable.
-    onProgress?.('Waiting for the verification code…');
-    const otpAppeared = await page
-      .waitForSelector(OTP_FIELD_SELECTOR, { timeout: 90_000 })
-      .then(() => true)
-      .catch(() => false);
-    if (!otpAppeared) {
-      await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses);
-      return fail(
-        'LOGIN_FAILED',
-        'The portal did not reach the verification-code step — the ID number ' +
-          'may have been rejected. A debug page was saved.',
-      );
-    }
-
-    // The guard at the top of scrapePension already returned for the no-OTP
-    // case, so onOtpNeeded is guaranteed defined for headless funds here.
-    const code = await onOtpNeeded!();
-    onProgress?.('Submitting the verification code…');
-    await enterOtpCode(page, (code ?? '').trim());
-
-    // Let the portal finish signing in once the code is submitted.
-    onProgress?.('Signing in…');
+    const otpAppeared = await page.waitForSelector(OTP_FIELD_SELECTOR, { visible: true, timeout: 90_000 })
+      .then(() => true).catch(() => false);
+    if (!otpAppeared) return fail('LOGIN_FAILED', 'The portal did not reach the verification-code step. Do not retry automatically.');
+    const code = (await onOtpNeeded!()).trim();
+    if (!/^\d+$/.test(code)) return fail('OTP_REJECTED', 'A numeric verification code is required. Do not retry automatically.');
+    await enterOtpCode(page, code);
     await delay(7000);
-
-    // Migdal shows balances on a separate "my products" page — the session
-    // cookie is set now, so navigate straight there.
-    if (fund.productsUrl) {
-      onProgress?.('Opening your products…');
-      try {
-        await page.goto(fund.productsUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      } catch {
-        // fall through and read whatever page is loaded
-      }
-    }
-    onProgress?.('Reading your balances…');
-    await delay(4000); // let the products page render its data
-    const accounts = await readBalances(fundId, page, screenshotPath);
-    await saveDebug(page, screenshotPath, htmlPath, dataPath, jsonResponses);
-
-    if (accounts.length === 0) {
-      return fail(
-        'NEEDS_SELECTORS',
-        'Signed in, but could not read the balances yet — the portal layout ' +
-          'still needs mapping, or the code was not accepted. The rendered ' +
-          'page was saved to the debug folder.',
-      );
-    }
-    await persistSession(browser, session);
-    return { success: true, accounts };
-  } catch (err) {
-    plog('EXCEPTION in', fundId, '—', err instanceof Error ? err.stack : String(err));
-    if (browser) {
-      const pages = await browser.pages().catch(() => []);
-      if (pages[0]) {
-        await saveDebug(pages[0], screenshotPath, htmlPath, dataPath, jsonResponses);
-      }
-    }
-    return fail('EXCEPTION', err instanceof Error ? err.message : String(err));
+    // Reuse the existing login-step selector. Presence alone is not proof of rejection:
+    // only a still-visible input means the verification step is unresolved.
+    const otpStillVisible = await page.$eval(OTP_FIELD_SELECTOR, (element) => {
+      const box = element.getBoundingClientRect();
+      return box.width > 0 && box.height > 0;
+    }).catch(() => false);
+    if (otpStillVisible) return fail('OTP_UNCONFIRMED', 'Verification is still displayed. Check the code manually; no automatic retry.');
+    if (fund.productsUrl) await page.goto(fund.productsUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delay(4000);
+    const read = await readBalances(fundId, page);
+    if (hasObservations(read)) await persistSession(browser, session);
+    return outcome(read);
+  } catch {
+    return fail('SCRAPE_FAILED', 'The portal or local storage operation failed. Check locally before retrying; raw errors are suppressed.');
   } finally {
     if (browser) await browser.close().catch(() => {});
+    activeConnections.delete(sessionKey);
   }
 }
 
@@ -698,7 +481,7 @@ async function fillPhone(page: Page, fund: PensionFund, rawPhone: string): Promi
 async function fillAndSubmitLogin(
   page: Page,
   fund: PensionFund,
-  credentials: Record<string, string>,
+  credentials: ScrapePensionArgs['credentials'],
 ): Promise<boolean> {
   plog('fillAndSubmitLogin: entered for', fund.id);
   // Only automated funds reach here; interactive funds carry no selectors.
@@ -746,13 +529,13 @@ async function fillAndSubmitLogin(
       .then(() => true)
       .catch(() => false);
     if (!ready) {
-      plog(`fillAndSubmitLogin: idSelector absent, attempt ${attempt}, url=${page.url()}`);
+      plog(`fillAndSubmitLogin: idSelector absent, attempt ${attempt}, portal navigation pending`);
       continue;
     }
     await delay(1500); // let the form finish rendering
     idFilled = await fillField(page, fund.idSelector, (credentials.id ?? '').trim());
     if (!idFilled) {
-      plog(`fillAndSubmitLogin: fillField missed, attempt ${attempt}, url=${page.url()}`);
+      plog(`fillAndSubmitLogin: fillField missed, attempt ${attempt}, portal navigation pending`);
     }
   }
   if (!idFilled) return false;
@@ -770,15 +553,7 @@ async function fillAndSubmitLogin(
       }, fund.smsRadioSelector)
       .catch(() => {});
   }
-  if (fund.termsCheckboxSelector) {
-    // A terms checkbox can gate submit; tick it if it is not already checked.
-    await page
-      .evaluate((sel: string) => {
-        const box: any = document.querySelector(sel);
-        if (box && !box.checked) box.click();
-      }, fund.termsCheckboxSelector)
-      .catch(() => {});
-  }
+  // A terms checkbox is never ticked here; scrapePension returns NEEDS_CONSENT first.
   await delay(800); // let Angular validate the form and enable the button
   if (!(await clickByText(page, fund.submitLabels))) {
     await page.keyboard.press('Enter');
@@ -796,7 +571,7 @@ async function fillAndSubmitLogin(
 async function prefillCredentials(
   page: Page,
   fund: PensionFund,
-  credentials: Record<string, string>,
+  credentials: ScrapePensionArgs['credentials'],
 ): Promise<void> {
   const id = (credentials.id ?? '').trim();
   if (!fund.idSelector || !id) return;
@@ -860,6 +635,7 @@ async function enterOtpCode(page: Page, code: string): Promise<void> {
     return picked.length;
   });
 
+  if (!boxes) throw new Error('OTP_INPUT_UNAVAILABLE');
   if (boxes >= 2) {
     for (let i = 0; i < boxes && i < digits.length; i += 1) {
       await page.click(`[data-hon-otp="${i}"]`).catch(() => {});
@@ -925,444 +701,198 @@ async function enterOtpCode(page: Page, code: string): Promise<void> {
 }
 
 /**
- * Dispatches to the per-fund balance reader, falling back to a generic
- * heuristic. Used by both the automated flow and the interactive poll loop —
- * for an interactive fund this is called repeatedly and returns an empty list
- * until the user's sign-in authenticates the session.
+ * Only source-evidenced fields are read. Missing IDs/dates never become invented
+ * accounts/current balances. Provider member identity and coverage remain unverified.
  */
-async function readBalances(
-  companyId: string,
-  page: Page,
-  screenshotPath: string | undefined,
-): Promise<NormalizedAccount[]> {
-  if (companyId === 'migdal') return readMigdalBalances(page);
-  if (companyId === 'harel') {
-    return readHarelBalances(page, debugSibling(screenshotPath, '-harel-frame.html'));
-  }
-  if (companyId === 'clal') return readClalBalances(page);
+interface BalanceRead {
+  accounts: NormalizedAccount[];
+  unresolvedProducts: NonNullable<ScrapeOutcome['unresolvedProducts']>;
+  warnings: string[];
+}
+function emptyRead(warning: string): BalanceRead {
+  return { accounts: [], unresolvedProducts: [], warnings: [warning] };
+}
+function hasObservations(read: BalanceRead): boolean {
+  return read.accounts.length > 0 || read.unresolvedProducts.length > 0;
+}
+function outcome(read: BalanceRead): ScrapeOutcome {
+  return {
+    success: read.accounts.length > 0,
+    accounts: read.accounts,
+    unresolvedProducts: read.unresolvedProducts,
+    complete: false,
+    identityVerified: false,
+    warnings: [...new Set(['MEMBER_IDENTITY_UNVERIFIED', 'PRODUCT_COVERAGE_UNVERIFIED',
+      'BALANCE_AS_OF_UNAVAILABLE', ...read.warnings])],
+    ...(read.accounts.length ? {} : { errorType: 'NEEDS_MAPPING',
+      errorMessage: 'No products with stable provider IDs could be returned. Inspect warnings and unresolvedProducts.' }),
+  };
+}
+
+async function readBalances(companyId: string, page: Page): Promise<BalanceRead> {
   if (companyId === 'meitav') return readMeitavBalances(page);
   if (companyId === 'menora') return readMenoraBalances(page);
-  return readGenericBalances(page);
+  if (companyId === 'migdal' || companyId === 'clal') return readLabelledBalances(page, companyId);
+  // Harel's broad keyword/largest-number reader matched IDs, totals and years.
+  // No stable product ID or unambiguous balance selector is evidenced here.
+  return emptyRead('PRODUCT_AND_BALANCE_MAPPING_REQUIRED');
 }
 
-/**
- * Reads balances from Migdal's "my products" page (verified live 2026-05-22):
- * each product is a `.table` block — the name is in an <a>, and the accumulated
- * balance is the <strong> whose preceding label reads "ערכי פדיון" (or, for a
- * gemel / study fund, "צבירה" / "יתרה"). Other <strong> values in the block
- * (deposits, projected monthly pension) are deliberately skipped by the label.
- */
-async function readMigdalBalances(page: Page): Promise<NormalizedAccount[]> {
-  await page.waitForSelector('.table', { timeout: 30_000 }).catch(() => {});
-  let products: { name: string; balance: number }[] = [];
-  try {
-    products = (await page.evaluate(() => {
-      const norm = (s: string): string => (s || '').replace(/\s+/g, ' ').trim();
-      const isBalanceLabel = (s: string): boolean =>
-        /ערכי פדיון|צבירה|יתרה|סך חיסכון|סך צבירה/.test(s);
-      const out: { name: string; balance: number }[] = [];
-      const tables: any[] = Array.from(document.querySelectorAll('.table'));
-      for (const table of tables) {
-        const link = table.querySelector('a');
-        const name = norm(link ? link.innerText : '');
-        if (!name) continue;
-        let balance = 0;
-        const strongs: any[] = Array.from(table.querySelectorAll('strong'));
-        for (const strong of strongs) {
-          // The value's label is a nearby preceding sibling.
-          let label = '';
-          let prev = strong.previousElementSibling;
-          for (let i = 0; prev && !label && i < 4; i += 1) {
-            label = norm(prev.innerText || '');
-            prev = prev.previousElementSibling;
-          }
-          if (!isBalanceLabel(label)) continue;
-          const value = parseFloat(norm(strong.innerText).replace(/[^\d.]/g, ''));
-          if (Number.isFinite(value) && value > balance) balance = value;
-        }
-        if (balance > 0) out.push({ name, balance });
-      }
-      return out;
-    })) as { name: string; balance: number }[];
-  } catch {
-    return [];
-  }
-  return products.map((p) => ({
-    accountNumber: `migdal:${p.name}`,
-    label: p.name,
-    balance: Math.round(p.balance * 100) / 100,
-    currency: 'ILS',
-    transactions: [],
-  }));
-}
-
-/**
- * Reads balances from Harel's "client-view" widget (verified live 2026-05-22):
- * products render inside a cross-origin iframe whose URL contains
- * "client-view"; each tile pairs a product name with a "₪ <amount>" figure.
- */
-async function readHarelBalances(
-  page: Page,
-  frameDumpPath?: string,
-): Promise<NormalizedAccount[]> {
-  // Pulls the product tiles out of the client-view widget frame: tries the
-  // keyword-matched blocks first, then falls back to any block carrying a
-  // shekel-sized figure so a single-product account still reports a balance.
-  // The frame.evaluate callbacks stay inline and anonymous on purpose — that
-  // keeps esbuild from injecting a `__name` wrapper, which need not exist in
-  // this cross-origin frame.
-  const extractTiles = async (
-    frame: Frame,
-  ): Promise<{ label: string; balance: number }[]> => {
-    let hits: { label: string; balance: number }[] = [];
-    try {
-      hits = (await frame.evaluate((keywords: string[]) => {
-        const results: { label: string; balance: number }[] = [];
-        const blocks: any[] = Array.from(
-          document.querySelectorAll('div, section, li, article'),
-        );
-        for (const block of blocks) {
-          const text: string = (block.innerText || '').replace(/\s+/g, ' ').trim();
-          if (!text || text.length > 200) continue;
-          if (!keywords.some((k) => text.includes(k))) continue;
-          let largest = 0;
-          for (const match of text.match(/[\d][\d.,]{3,}/g) || []) {
-            const value = parseFloat(match.replace(/[^\d.,]/g, '').replace(/,/g, ''));
-            if (Number.isFinite(value) && value > largest) largest = value;
-          }
-          if (largest < 1000) continue;
-          const label = text
-            .replace(/[\d][\d.,]*\s*₪?|₪/g, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 50);
-          results.push({ label: label || 'חיסכון', balance: largest });
-        }
-        return results;
-      }, PRODUCT_KEYWORDS)) as { label: string; balance: number }[];
-    } catch {
-      hits = [];
-    }
-    if (hits.length > 0) return hits;
-    try {
-      hits = (await frame.evaluate(() => {
-        const results: { label: string; balance: number }[] = [];
-        const blocks: any[] = Array.from(document.querySelectorAll('div, section, li, article'));
-        for (const block of blocks) {
-          const text: string = (block.innerText || '').replace(/\s+/g, ' ').trim();
-          if (!text || text.length > 200) continue;
-          if (!text.includes('₪')) continue;
-          let largest = 0;
-          for (const match of text.match(/[\d][\d.,]{3,}/g) || []) {
-            const value = parseFloat(match.replace(/[^\d.,]/g, '').replace(/,/g, ''));
-            if (Number.isFinite(value) && value > largest) largest = value;
-          }
-          if (largest < 1000) continue;
-          const label = text
-            .replace(/[\d][\d.,]*\s*₪?|₪/g, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 50);
-          results.push({ label: label || 'חיסכון', balance: largest });
-        }
-        return results;
-      })) as { label: string; balance: number }[];
-    } catch {
-      hits = [];
-    }
-    return hits;
-  };
-
-  // The client-view widget is a single-spa micro-frontend inside a cross-origin
-  // iframe; after sign-in Harel shows a loading screen first and the balance
-  // tiles render well after the iframe document loads. Poll the widget by
-  // running the real reader until it actually pulls a balance (up to ~75s) —
-  // a check that just looks for "any number" matches the loading screen's own
-  // digits and made the connector give up with a false "needs mapping".
-  const deadline = Date.now() + 75_000;
-  let frame: Frame | undefined;
-  let found: { label: string; balance: number }[] = [];
-  while (Date.now() < deadline) {
-    // The portal greets a fresh session with a privacy-policy modal and a
-    // cookie banner that sit over (and can stall) the widget. They can also
-    // appear late, so clear them on every pass rather than just once.
-    await clickByText(page, [
-      'הבנתי, תודה', 'הבנתי', 'אישור', 'סגירה', 'סגור', 'קיבלתי',
-    ]);
-    frame = page
-      .frames()
-      .find((f) => /client-view|digital\.harel/.test(f.url()));
-    if (frame) {
-      found = await extractTiles(frame);
-      if (found.length > 0) break;
-    }
-    await delay(1500);
-  }
-
-  // Always dump the widget frame's rendered HTML — if the reader missed, this
-  // is the material to map the tile structure precisely on the next pass.
-  if (frameDumpPath && frame) {
-    try {
-      writeFileSync(frameDumpPath, await frame.content(), 'utf8');
-    } catch {
-      /* best effort */
-    }
-  }
-
-  // One entry per distinct balance; the tightest (shortest-label) block wins.
-  const byBalance = new Map<number, string>();
-  for (const item of found) {
-    const prev = byBalance.get(item.balance);
-    if (prev === undefined || item.label.length < prev.length) {
-      byBalance.set(item.balance, item.label);
-    }
-  }
-  return [...byBalance].map(([balance, label]) => ({
-    accountNumber: `harel:${label}`,
-    label,
-    balance: Math.round(balance * 100) / 100,
-    currency: 'ILS',
-    transactions: [],
-  }));
-}
-
-/**
- * Reads balances from Clal's portfolio page (verified live 2026-05-22):
- * `www.clalbit.co.il/portfolio/`. Each product is an `h2.link-title` (the
- * product type, e.g. "קרן פנסיה") paired with a sibling `.financial-data-sum`
- * whose spans (shekel + bigger-value + "." + smaller-value) concatenate to the
- * accrued balance. The page also lists non-savings products under "מוצרי עבר"
- * (e.g. travel insurance) — a product-keyword filter keeps only savings.
- */
-async function readClalBalances(page: Page): Promise<NormalizedAccount[]> {
-  let found: { label: string; provider: string; balance: number }[] = [];
-  try {
-    found = (await page.evaluate((keywords: string[]) => {
-      const norm = (s: string): string => (s || '').replace(/\s+/g, ' ').trim();
-      const out: { label: string; provider: string; balance: number }[] = [];
-      const titles: any[] = Array.from(document.querySelectorAll('h2.link-title'));
-      for (const title of titles) {
-        const label = norm(title.innerText || '');
-        // Skip insurance and other non-savings products (travel, etc.).
-        if (!keywords.some((k) => label.includes(k))) continue;
-        const row = title.parentElement;
-        const sumEl = row ? row.querySelector('.financial-data-sum') : null;
-        if (!sumEl) continue;
-        const raw = norm(sumEl.innerText || '').replace(/,/g, '');
-        const value = parseFloat((raw.match(/[\d]+(?:\.[\d]+)?/) || ['0'])[0]);
-        if (!Number.isFinite(value)) continue;
-        // The provider name sits in a `.link-info` within the product card.
-        let provider = '';
-        let card = row;
-        for (let i = 0; card && !provider && i < 6; i += 1) {
-          const info = card.querySelector('.link-info');
-          if (info) provider = norm(info.innerText || '');
-          card = card.parentElement;
-        }
-        out.push({ label, provider, balance: value });
-      }
-      return out;
-    }, PRODUCT_KEYWORDS)) as {
-      label: string;
-      provider: string;
-      balance: number;
-    }[];
-  } catch {
-    return [];
-  }
-  return found.map((p) => {
-    const name = p.provider ? `${p.label} — ${p.provider}` : p.label;
-    return {
-      accountNumber: `clal:${name}`,
-      label: name,
-      balance: Math.round(p.balance * 100) / 100,
-      currency: 'ILS',
-      transactions: [],
-    };
-  });
-}
-
-interface MeitavRow {
-  name: string;
-  accountNum: string | number | null;
-  balance: number | null;
-}
-
-/**
- * Reads balances from Meitav's member portal API (interactive fund — the user
- * signs in by hand first). GET /v2/api/AllAccounts/GetAllAmitAccounts returns
- * `{ t: { CustomPensionAccountMain[], CustomAccountMain[] } }`; each fund row
- * carries `AccountNumForShow` (name) and `YitrotAccountSum` (current balance).
- * The same fund recurs once per period — dedup by account number, keeping the
- * largest (latest) balance. Returns [] until the session is authenticated.
- */
-async function readMeitavBalances(page: Page): Promise<NormalizedAccount[]> {
-  let raw: { pension: MeitavRow[]; other: MeitavRow[] } | null = null;
-  try {
-    raw = (await page.evaluate(async () => {
-      const res = await fetch('/v2/api/AllAccounts/GetAllAmitAccounts', {
-        credentials: 'include',
-      });
-      if (!res.ok) return null;
-      const data: any = await res.json();
-      const t: any = data && data.t ? data.t : data;
-      const pick = (arr: any[]): any[] =>
-        (arr || []).map((p: any) => ({
-          name: p.AccountNumForShow,
-          accountNum: p.AccountNum,
-          balance: p.YitrotAccountSum,
-        }));
-      return { pension: pick(t.CustomPensionAccountMain), other: pick(t.CustomAccountMain) };
-    })) as { pension: MeitavRow[]; other: MeitavRow[] } | null;
-  } catch {
-    return [];
-  }
-  if (!raw) return [];
-  const byAccount = new Map<string, { name: string; balance: number }>();
-  for (const row of [...raw.pension, ...raw.other]) {
-    const balance = Number(row.balance);
-    const name = (row.name ?? '').trim();
-    if (!name || !Number.isFinite(balance)) continue;
-    const key = String(row.accountNum ?? name);
-    const prev = byAccount.get(key);
-    if (!prev || balance > prev.balance) byAccount.set(key, { name, balance });
-  }
-  return [...byAccount.values()].map((p) => ({
-    accountNumber: `meitav:${p.name}`,
-    label: p.name,
-    balance: Math.round(p.balance * 100) / 100,
-    currency: 'ILS',
-    transactions: [],
-  }));
-}
-
-/**
- * Reads balances from Menora Mivtachim's dashboard API (interactive fund — the
- * user signs in by hand first). POST /personal/dashboard/api/v1/customer-
- * summary/active returns `{ data: { pension[], socialBenefit[], managerFund[],
- * annuity[], … } }`; `socialBenefit` holds both gemel and study (השתלמות)
- * funds. Each savings row carries `title` (name) and `cashSurrenderValue`
- * (accrued balance). Insurance arrays and `forecastPension` (a projected
- * monthly payout, not a balance) are ignored. Returns [] until authenticated.
- */
-async function readMenoraBalances(page: Page): Promise<NormalizedAccount[]> {
-  let rows: { name: string; balance: number }[] | null = null;
-  try {
-    rows = (await page.evaluate(async () => {
-      const uuid =
-        Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
-      const res = await fetch(
-        '/personal/dashboard/api/v1/customer-summary/active?counter=1&uuid=' + uuid,
-        { method: 'POST', credentials: 'include' },
-      );
-      if (!res.ok) return null;
-      const body: any = await res.json();
-      const d: any = body && body.data ? body.data : {};
-      const pick = (arr: any[]): any[] =>
-        (arr || []).map((p: any) => ({ name: p.title, balance: p.cashSurrenderValue }));
-      return ([] as any[]).concat(
-        pick(d.pension),
-        pick(d.socialBenefit),
-        pick(d.managerFund),
-        pick(d.annuity),
-      );
-    })) as { name: string; balance: number }[] | null;
-  } catch {
-    return [];
-  }
-  if (!rows) return [];
-  const out: NormalizedAccount[] = [];
+function unresolved(rows: { name: string; balance: unknown }[]): BalanceRead {
+  const read = emptyRead('PRODUCT_ID_UNAVAILABLE');
   for (const row of rows) {
-    const balance = Number(row.balance);
-    const name = (row.name ?? '').trim();
-    if (!name || !Number.isFinite(balance) || balance <= 0) continue;
-    out.push({
-      accountNumber: `menora:${name}`,
-      label: name,
-      balance: Math.round(balance * 100) / 100,
-      currency: 'ILS',
-      transactions: [],
-    });
+    if (typeof row.name !== 'string' || !row.name.trim()
+      || (typeof row.balance !== 'string' && typeof row.balance !== 'number')
+      || (typeof row.balance === 'string' && !/^-?\d+(?:\.\d+)?$/.test(row.balance.trim()))) {
+      read.warnings.push('INVALID_PRODUCT_OBSERVATION');
+      continue;
+    }
+    const amount = Number(row.balance);
+    if (!Number.isFinite(amount)) {
+      read.warnings.push('INVALID_BALANCE_OBSERVATION');
+      continue;
+    }
+    read.unresolvedProducts.push({ label: row.name, observedBalance: amount,
+      balanceAsOf: null, observedAt: new Date().toISOString(), currency: 'ILS', reason: 'PRODUCT_ID_UNAVAILABLE' });
   }
-  return out;
+  return read;
 }
 
-/**
- * Fallback balance reader for any portal without a precise mapping: finds page
- * blocks that name a pension product and pairs each with the largest shekel-
- * sized number inside it. A miss is expected — saveDebug keeps the page.
- */
-async function readGenericBalances(page: Page): Promise<NormalizedAccount[]> {
-  let found: { label: string; balance: number }[] = [];
+async function readLabelledBalances(page: Page, companyId: string): Promise<BalanceRead> {
+  if (companyId === 'migdal') await page.waitForSelector('.table', { timeout: 30_000 }).catch(() => {});
   try {
-    found = (await page.evaluate((keywords: string[]) => {
-      const toAmount = (text: string): number | null => {
-        const cleaned = (text || '').replace(/[^\d.,]/g, '').replace(/,/g, '');
-        const value = parseFloat(cleaned);
+    const rows = await page.evaluate((company: string, keywords: string[]) => {
+      const norm = (s: string): string => (s || '').replace(/\s+/g, ' ').trim();
+      const amount = (s: string): number | null => {
+        const text = norm(s).replace(/[₪\s]/g, '');
+        if (!/^-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(text)) return null;
+        const value = Number(text.replace(/,/g, ''));
         return Number.isFinite(value) ? value : null;
       };
-      const results: { label: string; balance: number }[] = [];
-      const blocks: any[] = Array.from(
-        document.querySelectorAll('div, section, article, li, tr'),
-      );
-      for (const block of blocks) {
-        const text: string = (block.innerText || '').trim();
-        if (!text || text.length > 400) continue;
-        const keyword = keywords.find((k) => text.includes(k));
-        if (!keyword) continue;
-        let largest = 0;
-        for (const match of text.match(/[\d][\d.,]{3,}/g) || []) {
-          const value = toAmount(match);
-          if (value != null && value > largest) largest = value;
+      const found: { name: string; balance: number | null }[] = [];
+      if (company === 'migdal') {
+        const tables: any[] = Array.from(document.querySelectorAll('.table'));
+        for (const table of tables) {
+          const name = norm(table.querySelector('a')?.innerText || '');
+          if (!name) continue;
+          const balances: (number | null)[] = [];
+          const strongs: any[] = Array.from(table.querySelectorAll('strong'));
+          for (const strong of strongs) {
+            let label = '';
+            let previous = strong.previousElementSibling;
+            for (let i = 0; previous && !label && i < 4; i += 1) {
+              label = norm(previous.innerText || '');
+              previous = previous.previousElementSibling;
+            }
+            if (/ערכי פדיון|צבירה|יתרה|סך חיסכון|סך צבירה/.test(label)) balances.push(amount(strong.innerText));
+          }
+          // Multiple labelled values have no evidenced date ordering. Do not take max.
+          found.push({ name, balance: balances.length === 1 ? balances[0] ?? null : null });
         }
-        // Pension balances are at least a few thousand shekels; smaller hits
-        // are fees or contribution amounts, not the accumulated balance.
-        if (largest >= 1000) results.push({ label: keyword, balance: largest });
+      } else {
+        const titles: any[] = Array.from(document.querySelectorAll('h2.link-title'));
+        for (const title of titles) {
+          const name = norm(title.innerText || '');
+          if (!keywords.some((keyword) => name.includes(keyword))) continue;
+          const sum = title.parentElement?.querySelector('.financial-data-sum');
+          found.push({ name, balance: sum ? amount(sum.innerText) : null });
+        }
       }
-      return results;
-    }, PRODUCT_KEYWORDS)) as { label: string; balance: number }[];
+      return found;
+    }, companyId, PRODUCT_KEYWORDS);
+    return unresolved(rows);
   } catch {
-    return [];
+    return emptyRead('BALANCE_READ_FAILED');
   }
-
-  // One account per product type, keeping the largest balance seen for each.
-  const byLabel = new Map<string, number>();
-  for (const item of found) {
-    byLabel.set(item.label, Math.max(byLabel.get(item.label) ?? 0, item.balance));
-  }
-  return [...byLabel].map(([label, balance]) => ({
-    accountNumber: `pension:${label}`,
-    label,
-    balance: Math.round(balance * 100) / 100,
-    currency: 'ILS',
-    transactions: [],
-  }));
 }
 
-/** Saves a screenshot, the rendered HTML and the captured JSON for diagnosis. */
-async function saveDebug(
-  page: Page,
-  screenshotPath: string | undefined,
-  htmlPath: string | undefined,
-  dataPath: string | undefined,
-  jsonResponses: { url: string; body: string }[],
-): Promise<void> {
+interface MeitavRow { name: unknown; accountNum: unknown; balance: unknown; }
+async function readMeitavBalances(page: Page): Promise<BalanceRead> {
   try {
-    if (screenshotPath) {
-      const shot = await page.screenshot({ fullPage: true });
-      writeFileSync(screenshotPath, shot);
+    const response: { rows: MeitavRow[]; missingCollections: boolean } | null = await page.evaluate(async () => {
+      const res = await fetch('/v2/api/AllAccounts/GetAllAmitAccounts', { credentials: 'include' });
+      if (!res.ok) return null;
+      const data: any = await res.json();
+      const t: any = data?.t ?? data;
+      const collections = [t?.CustomPensionAccountMain, t?.CustomAccountMain];
+      if (!collections.some(Array.isArray)) return null;
+      return { missingCollections: !collections.every(Array.isArray),
+        rows: collections.filter(Array.isArray).flat().map((p: any) => ({
+          name: p?.AccountNumForShow, accountNum: p?.AccountNum, balance: p?.YitrotAccountSum,
+        })) };
+    });
+    if (!response) return emptyRead('BALANCE_RESPONSE_UNAVAILABLE');
+    const read: BalanceRead = { accounts: [], unresolvedProducts: [], warnings: [] };
+    if (response.missingCollections) read.warnings.push('PRODUCT_COLLECTION_UNAVAILABLE');
+    const grouped = new Map<string, MeitavRow[]>();
+    for (const row of response.rows) {
+      if ((typeof row.accountNum !== 'string' && typeof row.accountNum !== 'number')
+        || (typeof row.accountNum === 'number' && !Number.isSafeInteger(row.accountNum))
+        || !String(row.accountNum).trim()) {
+        read.warnings.push('PRODUCT_ID_UNAVAILABLE');
+        if (typeof row.name === 'string') {
+          const missing = unresolved([{ name: row.name, balance: row.balance }]);
+          read.unresolvedProducts.push(...missing.unresolvedProducts);
+          read.warnings.push(...missing.warnings);
+        }
+        continue;
+      }
+      const key = String(row.accountNum);
+      grouped.set(key, [...(grouped.get(key) ?? []), row]);
     }
+    for (const [id, matches] of grouped) {
+      if (matches.length !== 1) {
+        // Even equal amounts may represent different periods. No date field is evidenced.
+        read.warnings.push('AMBIGUOUS_DUPLICATE_PRODUCT');
+        for (const candidate of matches) {
+          if (typeof candidate.name !== 'string') continue;
+          const observations = unresolved([{ name: candidate.name, balance: candidate.balance }]);
+          read.unresolvedProducts.push(...observations.unresolvedProducts.map((observation) => ({
+            ...observation, reason: 'AMBIGUOUS_DUPLICATE_PRODUCT' as const, providerProductId: 'meitav:' + id,
+          })));
+          if (!observations.unresolvedProducts.length) read.warnings.push('INVALID_BALANCE_OBSERVATION');
+        }
+        continue;
+      }
+      const row = matches[0]!;
+      if ((typeof row.balance !== 'string' && typeof row.balance !== 'number')
+        || (typeof row.balance === 'string' && !/^-?\d+(?:\.\d+)?$/.test(row.balance.trim()))
+        || !Number.isFinite(Number(row.balance))) {
+        read.warnings.push('INVALID_BALANCE_OBSERVATION');
+        continue;
+      }
+      read.accounts.push({ accountNumber: 'meitav:' + id,
+        label: typeof row.name === 'string' ? row.name : undefined,
+        observedBalance: Number(row.balance), balanceAsOf: null, observedAt: new Date().toISOString(),
+        currency: 'ILS', transactions: [] });
+    }
+    return read;
   } catch {
-    // best-effort
+    return emptyRead('BALANCE_READ_FAILED');
   }
+}
+
+async function readMenoraBalances(page: Page): Promise<BalanceRead> {
   try {
-    if (htmlPath) writeFileSync(htmlPath, await page.content());
+    const response = await page.evaluate(async () => {
+      const uuid = Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+      const res = await fetch('/personal/dashboard/api/v1/customer-summary/active?counter=1&uuid=' + uuid,
+        { method: 'POST', credentials: 'include' });
+      if (!res.ok) return null;
+      const body: any = await res.json();
+      const d: any = body?.data;
+      if (!d) return null;
+      const collections = [d.pension, d.socialBenefit, d.managerFund, d.annuity];
+      if (!collections.some(Array.isArray)) return null;
+      return { missingCollections: !collections.every(Array.isArray),
+        rows: collections.filter(Array.isArray).flat()
+          .map((p: any) => ({ name: p?.title, balance: p?.cashSurrenderValue })) };
+    });
+    if (!response) return emptyRead('BALANCE_RESPONSE_UNAVAILABLE');
+    const read = unresolved(response.rows);
+    if (response.missingCollections) read.warnings.push('PRODUCT_COLLECTION_UNAVAILABLE');
+    return read;
   } catch {
-    // best-effort
-  }
-  try {
-    if (dataPath) writeFileSync(dataPath, JSON.stringify(jsonResponses, null, 2));
-  } catch {
-    // best-effort
+    return emptyRead('BALANCE_READ_FAILED');
   }
 }

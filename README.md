@@ -1,201 +1,67 @@
 # israeli-pension-scrapers
 
-Scrape Israeli **pension funds (קרנות פנסיה)**, **study funds (קרן השתלמות)** and **provident funds (קופות גמל)** balances from the major providers. The sibling of [`israeli-bank-scrapers`](https://github.com/eshaham/israeli-bank-scrapers) for the long-term savings side of an Israeli household balance sheet.
+A browser connector for pension, study-fund and provident-fund observations. This candidate has source corrections only; it has not been built, tested against portals or approved for live financial use.
 
-| Provider | Hebrew | How it signs in |
-|---|---|---|
-| **Migdal** | מגדל | Headless · automated OTP |
-| **Harel** | הראל | Headless · automated OTP |
-| **Clal** | כלל | Headless · automated OTP |
-| **Meitav** | מיטב | Visible Chromium window · you sign in once, cookies persist |
-| **Menora Mivtachim** | מנורה מבטחים | Visible Chromium window · you sign in once, cookies persist |
+## Result contract
 
-Works on **macOS**, **Linux** and **Windows**. Saved sessions live under the OS-conventional per-user data directory so the next sync just resumes.
+Read `complete`, `identityVerified`, `warnings` and `unresolvedProducts` even when `success` is true.
 
----
+- `accounts` contains only products with source-evidenced provider IDs. Currently only Meitav exposes such a field in this mapping (`AccountNum`). IDs are provider-qualified; labels and equal amounts are never deduplication keys.
+- `observedBalance` is the amount in a fetched response, including zero. `observedAt` is retrieval time. `balanceAsOf: null` means the provider's balance date is unavailable. It does **not** mean the amount is current. `balance` remains absent until a dated current-balance mapping is evidenced.
+- Duplicate Meitav IDs are excluded with `AMBIGUOUS_DUPLICATE_PRODUCT`, including equal-value duplicates: no largest/historical-maximum selection and no assumed date ordering. Their labelled amounts remain in `unresolvedProducts`, tagged with the product ID and ambiguity reason, for manual review only.
+- Migdal, Clal and Menora retain specifically labelled source amounts in `unresolvedProducts`, with no fabricated account ID. Do not aggregate or merge these by name/value. Multiple Migdal balance candidates are rejected.
+- Harel's broad number/keyword and generic fallback readers were removed: policy numbers, totals and years cannot safely identify product balances. It returns `NEEDS_MAPPING` before any login or OTP request.
+- No reviewed provider mapping verifies member identity, product coverage or as-of dates. Every result therefore has `complete: false` and `identityVerified: false`. `success` only means at least one stable-ID observation was returned. Missing data is not a zero balance.
 
-## Install
+`PENSION_COMPANIES`, `FUND_IDS` and `isPensionCompany` remain available. Full types are in [src/types.ts](./src/types.ts).
 
-```sh
-npm install israeli-pension-scrapers
-```
+## Session isolation and storage
 
-Puppeteer downloads its own Chromium on `npm install`. The **interactive** funds (Meitav, Menora) prefer the **real Google Chrome** installed on the system because its reCAPTCHA reputation carries across runs — install [Google Chrome](https://www.google.com/chrome/) if you plan to use those.
+`scrapePension({ fundId, credentials, connectionId, session, profileBaseDir, ... })` hashes the full tuple of provider, connection ID and member ID for **both** cookie-store keys and browser profiles. It never truncates or sanitizes IDs into a shared key. Supply a distinct connection ID per member; an ID is required when `credentials.id` is absent. Changing any tuple component starts a new session. This isolates state but cannot prove that a person signing in manually selected the intended member.
 
-## Quick start
+By default every scrape starts with fresh memory-only cookies and a temporary browser profile. Nothing is persisted. To reuse cookies within one process, explicitly share a `createMemorySessionStore()` instance. Persistence requires a caller-selected store, such as a vault or `createFileSessionStore(...)`.
 
-```ts
-import { scrapePension } from 'israeli-pension-scrapers';
+The opt-in file store writes **unencrypted replayable cookies** in the OS user data directory:
 
-const result = await scrapePension({
-  fundId: 'migdal',
-  credentials: { id: '123456789' },          // ID number (תעודת זהות)
-  connectionId: 'my-migdal-account',         // any string — used to key the saved session
-  onProgress: (msg) => console.log(msg),
-  onOtpNeeded: async () => prompt('SMS code') ?? '',
-});
-
-if (!result.success) {
-  console.error(result.errorType, result.errorMessage);
-  process.exit(1);
-}
-
-for (const account of result.accounts) {
-  console.log(account.label, account.balance, account.currency);
-}
-```
-
-There's a runnable version in [`examples/quick-start.ts`](./examples/quick-start.ts):
-
-```sh
-PENSION_ID=123456789 npx tsx examples/quick-start.ts migdal
-PENSION_ID=123456789 PENSION_PHONE=0501234567 npx tsx examples/quick-start.ts harel
-npx tsx examples/quick-start.ts meitav     # opens a visible window
-```
-
-## How it works
-
-Pension providers each run their own member portal, with no shared scraping library. This package drives each one in a Puppeteer browser (with `puppeteer-extra-plugin-stealth` to mask the most obvious automation tells) and reads the accumulated balance of every product the member holds.
-
-Two sign-in modes:
-
-### 1. Headless OTP login — Migdal, Harel, Clal
-
-The portal is passwordless: enter your ID (and phone, where required), the portal sends an SMS, you relay the code through `onOtpNeeded`. Runs entirely headless.
-
-```ts
-await scrapePension({
-  fundId: 'harel',
-  credentials: { id: '123456789', phone: '0501234567' },
-  connectionId: 'harel-1',
-  onOtpNeeded: askUserForSmsCode,
-});
-```
-
-### 2. Visible-window sign-in — Meitav, Menora
-
-These two wall their login with **reCAPTCHA Enterprise / Radware / hCaptcha** that resists automation. The library opens a real Chromium window, pre-fills your ID/phone, and waits up to **5 minutes** for you to clear the security check and submit the SMS code yourself. Once you do, the saved session cookies (encrypted by your `SessionStore`) make every subsequent sync resume without any browser window at all — until the session expires (a few days, set by the provider).
-
-```ts
-await scrapePension({
-  fundId: 'meitav',
-  credentials: { id: '123456789', phone: '0501234567' },
-  connectionId: 'meitav-1',
-  // No onOtpNeeded — you enter the code in the browser window yourself.
-});
-```
-
-## Cross-platform data directory
-
-The default {@link SessionStore} writes one JSON file per `connectionId` under:
-
-| OS | Path |
+| OS | Directory |
 |---|---|
 | macOS | `~/Library/Application Support/israeli-pension-scrapers/` |
-| Windows | `%APPDATA%\israeli-pension-scrapers\` |
-| Linux | `$XDG_DATA_HOME/israeli-pension-scrapers/` (falls back to `~/.local/share/…`) |
+| Windows | `%APPDATA%/israeli-pension-scrapers/` |
+| Linux | `$XDG_DATA_HOME/israeli-pension-scrapers/`, defaulting to `~/.local/share/israeli-pension-scrapers/` |
 
-The persistent Chrome profile used by Meitav/Menora lives under `browser-profiles/<fundId>/` in the same directory.
+Files are written atomically with POSIX 0600 modes and private directories. Invalid, future-dated or expired bundles are deleted on load (default TTL seven days). File modes do not secure Windows ACLs; use a private directory controlled by your OS. File expiration does not revoke a provider session.
 
-You can override the path:
+A custom `SessionStore` must implement asynchronous `load(key)`, `save(key, cookies)` and `clear(key)`. The key is opaque. Store secrets outside source control and exported records.
 
-```ts
-import { scrapePension, createFileSessionStore } from 'israeli-pension-scrapers';
+Browser profiles are ephemeral by default, including when using a vault. `profileBaseDir` explicitly opts into persistent, unencrypted browser state under `<profileBaseDir>/<full-identity-hash>`. Keep that directory private. When cookies are missing/expired, the matching profile is removed before launch so it cannot resurrect an old session. A custom cookie `baseDir` never creates a hidden profile elsewhere.
 
-const session = createFileSessionStore({ baseDir: '/var/lib/myapp/pension-sessions' });
-await scrapePension({ fundId: 'migdal', credentials: { id }, session, /* … */ });
-```
+Concurrent scrapes of the same full connection key are rejected with `CONNECTION_BUSY` within this process. Separate processes must coordinate access to persistent profiles; do not share one concurrently.
 
-Or supply your own store backed by a vault, database, or anything else:
+Close active scrapes before calling:
 
 ```ts
-import type { SessionStore } from 'israeli-pension-scrapers';
-
-const session: SessionStore = {
-  async load(connectionId) { return await myVault.get(connectionId); },
-  async save(connectionId, cookies) { await myVault.put(connectionId, cookies); },
-};
+await clearPensionSession({
+  fundId, connectionId, memberId: credentials.id, session, profileBaseDir,
+});
 ```
 
-## API
+Pass the same identity/store/profile options used to scrape. This clears local state only; use the provider's sign-out/revoke controls to invalidate remote sessions. Legacy fund-only profiles and sanitized cookie files are never reused or migrated automatically; remove those old files locally after closing browsers if they are no longer needed.
 
-### `scrapePension(args)`
+## Login and failures
 
-```ts
-interface ScrapePensionArgs {
-  fundId: 'migdal' | 'harel' | 'clal' | 'meitav' | 'menora';
-  credentials: { id?: string; phone?: string };
-  onProgress?: (message: string) => void;
-  onOtpNeeded?: () => Promise<string>;       // Required for the headless funds
-  connectionId?: string;                     // Session-store key; defaults to `${fundId}-default`
-  session?: SessionStore;                    // Defaults to file-based store
-  screenshotPath?: string;                   // Where to dump a failure screenshot
-  headless?: boolean;                        // Override the headless default
-}
+Migdal uses the existing OTP form mapping and requires `onOtpNeeded`. Clal's login form has a terms checkbox that gates submission. The library never ticks it, so a fresh Clal login returns `NEEDS_CONSENT` before the login page is opened or any form is filled or submitted; a saved Clal session can still be read, and configuration still requires `onOtpNeeded`. Accepting the portal's current terms is for the account holder. No consent is recorded or implied, and any future consent step would need the exact terms version mapped and the holder's approval on each run. Harel's form mapping is kept but not run until a balance mapping exists. Meitav and Menora open a visible browser for manual sign-in. An empty or nonnumeric OTP returns `OTP_REJECTED`; a still-visible verification input returns `OTP_UNCONFIRMED`. Neither is labelled a successful login or a selector update. No automatic OTP retry is performed.
 
-interface PensionScrapeOutcome {
-  success: boolean;
-  accounts: PensionAccount[];
-  errorType?: string;                        // 'CONFIG' | 'LOGIN_FAILED' | 'INTERACTIVE_TIMEOUT' | …
-  errorMessage?: string;
-}
+`CONFIG`, `CONNECTION_BUSY`, `LOGIN_FAILED`, `INTERACTIVE_TIMEOUT`, `NEEDS_MAPPING`, `NEEDS_CONSENT` and `SCRAPE_FAILED` are other failure codes. Errors omit raw portal exception text. Failed session persistence is best effort; a subsequent login may be required.
 
-interface PensionAccount {
-  accountNumber: string;                     // Stable per-product id
-  label?: string;                            // Product name as the portal shows it
-  balance?: number;                          // Accumulated balance
-  currency: string;                          // ILS in practice
-  transactions: never[];                     // For shape-compat with bank scrapers
-}
-```
+`screenshotPath` is deprecated and ignored. Raw screenshots, authenticated HTML, iframe dumps and network JSON are neither captured nor written on success or failure. Diagnostics contain fixed codes only. Contribute synthetic or fully redacted fixtures, never raw account/session data.
 
-### `PENSION_COMPANIES`
+The browser uses ordinary Puppeteer settings, without stealth, spoofed user agents or automation-detection switches. If access is refused, stop and use the provider's official/manual channels. Automated financial access may have provider-terms or legal requirements; no legal authorization or open-API availability is asserted here.
 
-A ready-made catalog you can drop into an "Add connection" picker:
+`headless: false` or `PENSION_SCRAPERS_HEADFUL=1` displays the browser for inspection. Do not use a display-mode change to circumvent a refusal. `PENSION_SCRAPERS_NO_SANDBOX=1` is the existing explicit container option; ordinary launches retain the sandbox.
 
-```ts
-import { PENSION_COMPANIES } from 'israeli-pension-scrapers';
-// → [{ id: 'migdal', name: 'Migdal (מגדל)', loginFields: ['id'],
-//      type: 'pension', domain: 'migdal.co.il', interactive: false }, …]
-```
+## Remaining verification
 
-### `FUND_IDS`
-
-Every fund id the library knows, in catalog order. Use it to validate user input.
-
-### `createFileSessionStore(opts?)` / `defaultDataDir(appName?)`
-
-Helpers for the default file-based session store. See the source of [`src/session.ts`](./src/session.ts) for options.
-
-## Environment variables
-
-| Variable | What it does |
-|---|---|
-| `PENSION_SCRAPERS_HEADFUL=1` | Launch every fund in a visible browser, including the headless ones (useful for debugging WAF / bot-detection rejections). |
-| `PENSION_SCRAPERS_NO_SANDBOX=1` | Drop Chromium's sandbox flag. Set this in Docker images where Chromium runs as root with no user namespace. |
-
-## Error handling
-
-On any failure `result.success === false` and `errorType` is one of:
-
-| `errorType` | Meaning |
-|---|---|
-| `CONFIG` | Missing or bad input (unknown `fundId`, no ID number, missing `onOtpNeeded` for a headless fund). |
-| `LOGIN_FAILED` | The portal rejected the credentials or the code, or the form layout shifted enough that the library couldn't find it. A debug HTML page is written next to `screenshotPath` if provided. |
-| `INTERACTIVE_TIMEOUT` | The user did not complete the visible-window sign-in within the 5-minute window. |
-| `NEEDS_SELECTORS` | Signed in successfully, but couldn't pin down the balances — the portal layout has likely changed and the reader needs updating. The rendered DOM is dumped to `*-pension.html` next to your screenshot path. |
-| `EXCEPTION` | An unexpected error escaped — `errorMessage` carries the underlying message. |
-
-## Why this exists
-
-Israel's pension/gemel/study-fund ecosystem is fragmented across half a dozen large providers, each with a distinct portal, each lacking an open API. Membership data is therefore scattered across as many member portals as you have products — a real friction point for anyone trying to see their long-term savings the way [israeli-bank-scrapers](https://github.com/eshaham/israeli-bank-scrapers) lets you see your bank and card balances. This library closes the gap.
-
-## Contributing
-
-Pull requests welcome, especially:
-- **New providers** — Phoenix (הפניקס), Altshuler-Shaham (אלטשולר שחם), Psagot (פסגות), Yelin Lapidot (ילין לפידות), …
-- **Selector updates** when a portal redesigns
-- **Test fixtures** captured from a real sync (`*-pension.html` + `*-pension.json` next to a failure screenshot are a great starting point)
+Current member identity fields, stable IDs outside Meitav, balance dates, response coverage and account-to-period semantics need provider evidence. No field names were invented. Dependency/browser compatibility and the changed TypeScript API still need an authorized offline build and synthetic validation before any separate live-use decision.
 
 ## License
 

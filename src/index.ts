@@ -18,7 +18,10 @@ export type {
 
 export {
   createFileSessionStore,
+  createMemorySessionStore,
   defaultDataDir,
+  connectionKey,
+  clearPensionSession,
 } from './session.js';
 
 export type { FileSessionStoreOptions } from './session.js';
